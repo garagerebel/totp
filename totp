@@ -1,0 +1,158 @@
+#!/bin/bash
+
+# Path to the encrypted database
+DB_PATH="$HOME/.otp/seeds.db"
+
+# Prompt for encryption key
+prompt_key() {
+  read -sp "Enter encryption key: " ENCRYPTION_KEY
+  echo
+}
+
+# Verify the decryption key by attempting to read a simple query
+verify_key() {
+  # Try reading from the database
+  result=$(sqlcipher "$DB_PATH" <<EOF
+PRAGMA key = '$ENCRYPTION_KEY';
+SELECT id FROM seeds LIMIT 1;
+EOF
+)
+  
+  # Check if the result is valid
+  if [[ $? -ne 0 || -z "$result" ]]; then
+    echo "Error: Incorrect encryption key."
+    exit 1
+  fi
+}
+
+# Initialize the database if not present
+initialize_database() {
+  mkdir -p "$(dirname "$DB_PATH")" # Ensure the directory exists
+  sqlcipher "$DB_PATH" <<EOF
+PRAGMA key = '$ENCRYPTION_KEY';
+CREATE TABLE IF NOT EXISTS seeds (
+    id TEXT PRIMARY KEY,
+    seed TEXT NOT NULL
+);
+EOF
+  echo "Database initialized at $DB_PATH."
+}
+
+# Function to execute SQLCipher commands
+run_sqlcipher() {
+  sqlcipher "$DB_PATH" <<EOF
+PRAGMA key = '$ENCRYPTION_KEY';
+$1
+EOF
+}
+
+# Display usage
+usage() {
+  echo "Usage: $0 [command] [id] [seed]"
+  echo "Commands:"
+  echo "  list                List all stored seeds"
+  echo "  add <id> <seed>     Add a new seed (id = service name, seed = base32 secret)"
+  echo "  generate [id]       Generate TOTP for all stored seeds or a specific id"
+  echo "  load <filename>     Load seeds from a file (id:seed format)"
+  echo "Default operation is 'generate'."
+  exit 1
+}
+
+# List all stored seeds
+list_seeds() {
+  run_sqlcipher "SELECT id FROM seeds;" | tail -n +3
+}
+
+# Add a new seed
+add_seed() {
+  local id="$1"
+  local seed="$2"
+  if [[ -z "$id" || -z "$seed" ]]; then
+    echo "Error: Both id and seed are required."
+    exit 1
+  fi
+  run_sqlcipher "INSERT INTO seeds (id, seed) VALUES ('$id', '$seed');"
+  echo "Seed for $id added successfully."
+}
+
+# Load seeds from a file
+load_seeds() {
+  local filename="$1"
+  if [[ ! -f "$filename" ]]; then
+    echo "Error: File '$filename' does not exist."
+    exit 1
+  fi
+
+  while IFS=: read -r id seed; do
+    if [[ -n "$id" && -n "$seed" ]]; then
+      # Insert seed into database
+      run_sqlcipher "INSERT OR REPLACE INTO seeds (id, seed) VALUES ('$id', '$seed');"
+      echo "Seed for $id loaded successfully."
+    else
+      echo "Skipping invalid line: $id:$seed"
+    fi
+  done < "$filename"
+}
+
+# Generate TOTPs
+generate_totp() {
+  local id="$1"
+  if [[ -n "$id" ]]; then
+    # Generate TOTP for a specific id
+    local seed
+    seed=$(run_sqlcipher "SELECT seed FROM seeds WHERE id = '$id';" | tail -n 1)
+    if [[ -z "$seed" ]]; then
+      echo "Error: No seed found for id '$id'."
+      exit 1
+    fi
+    local totp
+    totp=$(oathtool --totp -b "$seed")
+    echo "$id - $totp"
+  else
+    # Generate TOTPs for all stored seeds
+    local results
+    results=$(run_sqlcipher "SELECT id, seed FROM seeds;" | tail -n +3)
+    while IFS='|' read -r id seed; do
+      seed=$(echo "$seed" | xargs)  # Remove extra spaces
+      if [[ -n "$id" && -n "$seed" ]]; then
+        local totp
+        totp=$(oathtool --totp -b "$seed")
+        echo "$id - $totp"
+      fi
+    done <<< "$results"
+  fi
+}
+
+# Main script logic
+if [[ ! -f "$DB_PATH" ]]; then
+  echo "Database not found. Initializing..."
+  prompt_key
+  initialize_database
+else
+  # Prompt for encryption key and verify it
+  prompt_key
+  verify_key
+fi
+
+# Parse command
+command="$1"
+shift
+
+case "$command" in
+  list)
+    list_seeds
+    ;;
+  add)
+    add_seed "$1" "$2"
+    ;;
+  generate|"")
+    generate_totp "$1"
+    ;;
+  load)
+    load_seeds "$1"
+    ;;
+  *)
+    usage
+    ;;
+esac
+
